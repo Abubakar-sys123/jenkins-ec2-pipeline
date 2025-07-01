@@ -1,1 +1,108 @@
+pipeline {
+  agent any
 
+  environment {
+    TABLE_NAME = "ami_lookup_table"
+    AWS_REGION = "us-east-1"
+  }
+
+  parameters {
+    choice(name: 'AMI_TYPE', choices: ['ubuntu', 'amazon-linux'], description: 'Select AMI Type')
+    choice(name: 'INSTANCE_TYPE', choices: ['t2.micro', 't2.medium'], description: 'Select EC2 Instance Type')
+    string(name: 'PRIVATE_IP', defaultValue: '10.0.1.100', description: 'Private IP for EC2')
+    choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform Action')
+  }
+
+  stages {
+
+    stage('Clone Terraform Repo') {
+      steps {
+        git credentialsId: 'github-cred-th-tier', url: 'https://github.com/Abubakar-sys123/instance-repo', branch: 'main'
+      }
+    }
+
+    stage('Fetch AMI ID from DynamoDB') {
+      steps {
+        script {
+          def lookupKey = "${AWS_REGION}#${params.AMI_TYPE}#${params.INSTANCE_TYPE}"
+          echo "Fetching AMI ID for: ${lookupKey}"
+
+          def amiId = sh(
+            script: """
+              aws dynamodb get-item \
+              --table-name ${TABLE_NAME} \
+              --key '{\"lookup_key\": {\"S\": \"${lookupKey}\"}}' \
+              --region ${AWS_REGION} \
+              --query 'Item.ami_id.S' \
+              --output text
+            """,
+            returnStdout: true
+          ).trim()
+
+          if (amiId == "None" || amiId == "") {
+            error("AMI ID not found for key: ${lookupKey}")
+          }
+
+          env.AMI_ID = amiId
+          echo "AMI ID Fetched: ${env.AMI_ID}"
+        }
+      }
+    }
+
+    stage('Load User Data Script') {
+      steps {
+        dir('dynamic_infra') {
+          script {
+            def scriptName = params.AMI_TYPE == 'ubuntu' ? 'user_data_ubuntu.sh' : 'user_data_amazon.sh'
+            def userData = readFile(scriptName)
+              .replaceAll('"', '\\"')
+              .replaceAll('\n', ' ')
+            env.USER_DATA = userData
+            echo "Loaded user data from ${scriptName}"
+          }
+        }
+      }
+    }
+
+    stage('Terraform Init') {
+      steps {
+        dir('dynamic_infra') {
+          sh 'terraform init'
+        }
+      }
+    }
+
+    stage('Terraform Plan') {
+      steps {
+        dir('dynamic_infra') {
+          sh """
+            terraform plan \
+              -var 'ami_id=${env.AMI_ID}' \
+              -var 'ami_type=${params.AMI_TYPE}' \
+              -var 'instance_type=${params.INSTANCE_TYPE}' \
+              -var 'private_ip=${params.PRIVATE_IP}' \
+              -var 'user_data=${env.USER_DATA}'
+          """
+        }
+      }
+    }
+
+    stage('Terraform Apply or Destroy') {
+      steps {
+        dir('dynamic_infra') {
+          script {
+            def tfCommand = (params.ACTION == 'destroy') ? 'destroy -auto-approve' : 'apply -auto-approve'
+            sh """
+              terraform ${tfCommand} \
+                -var 'ami_id=${env.AMI_ID}' \
+                -var 'ami_type=${params.AMI_TYPE}' \
+                -var 'instance_type=${params.INSTANCE_TYPE}' \
+                -var 'private_ip=${params.PRIVATE_IP}' \
+                -var 'user_data=${env.USER_DATA}'
+            """
+          }
+        }
+      }
+    }
+  }
+}
